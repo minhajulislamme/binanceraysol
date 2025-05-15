@@ -511,7 +511,7 @@ class RiskManager:
         
     def calculate_volatility_based_stop_loss(self, symbol, side, entry_price, klines=None):
         """
-        Calculate stop loss based on volatility (ATR) rather than fixed percentage
+        Enhanced volatility-based stop loss with dynamic multipliers and key level detection
         
         Args:
             symbol: Trading pair symbol
@@ -526,7 +526,7 @@ class RiskManager:
             return None
             
         # If no klines provided, use default percentage-based stop loss
-        if klines is None:
+        if klines is None or len(klines) < 20:
             return self.calculate_stop_loss(symbol, side, entry_price)
         
         # Special handling for RAYSOL tokens which have higher volatility
@@ -544,64 +544,175 @@ class RiskManager:
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = pd.to_numeric(df[col])
                 
-            # Calculate ATR
-            atr_period = 14
-            if len(df) >= atr_period:
-                # Use ta library ATR
-                atr = ta.volatility.average_true_range(
-                    df['high'], df['low'], df['close'], window=atr_period
-                ).iloc[-1]
+            # Find support/resistance levels (recent swing points)
+            highs = []
+            lows = []
+            
+            # Use a minimum of 30 candles for support/resistance detection if available
+            lookback = min(len(df), 50)
+            price_data = df[-lookback:].copy()
+            
+            # Find swing high/low points (simplified pivot detection)
+            for i in range(2, len(price_data) - 2):
+                # Swing high
+                if (price_data['high'].iloc[i] > price_data['high'].iloc[i-1] and
+                    price_data['high'].iloc[i] > price_data['high'].iloc[i-2] and
+                    price_data['high'].iloc[i] > price_data['high'].iloc[i+1] and
+                    price_data['high'].iloc[i] > price_data['high'].iloc[i+2]):
+                    highs.append(price_data['high'].iloc[i])
                 
-                # Calculate ATR as percentage of price
-                atr_pct = atr / entry_price
+                # Swing low
+                if (price_data['low'].iloc[i] < price_data['low'].iloc[i-1] and
+                    price_data['low'].iloc[i] < price_data['low'].iloc[i-2] and
+                    price_data['low'].iloc[i] < price_data['low'].iloc[i+1] and
+                    price_data['low'].iloc[i] < price_data['low'].iloc[i+2]):
+                    lows.append(price_data['low'].iloc[i])
+            
+            # Calculate various ATR periods for better volatility assessment
+            atr_short = ta.volatility.average_true_range(
+                df['high'], df['low'], df['close'], window=7
+            ).iloc[-1]
+            
+            atr_medium = ta.volatility.average_true_range(
+                df['high'], df['low'], df['close'], window=14
+            ).iloc[-1]
+            
+            atr_long = ta.volatility.average_true_range(
+                df['high'], df['low'], df['close'], window=21
+            ).iloc[-1]
+            
+            # Use weighted average ATR with more weight to recent volatility
+            atr = (atr_short * 0.5 + atr_medium * 0.3 + atr_long * 0.2)
+            
+            # Calculate ATR as percentage of price
+            atr_pct = atr / entry_price
+            
+            # Calculate price distance from entry to nearest support/resistance
+            nearest_support = None
+            nearest_resistance = None
+            
+            # For long positions, find nearest support below entry price
+            if side == "BUY":
+                valid_supports = [l for l in lows if l < entry_price]
+                if valid_supports:
+                    nearest_support = max(valid_supports)  # Closest support below entry
+            # For short positions, find nearest resistance above entry price
+            else:
+                valid_resistances = [h for h in highs if h > entry_price]
+                if valid_resistances:
+                    nearest_resistance = min(valid_resistances)  # Closest resistance above entry
+            
+            # Base multiplier on market condition with better risk management
+            if self.current_market_condition == 'EXTREME_BULLISH':
+                atr_multiplier = 2.5  # Wider stops in extreme bullish trend
+            elif self.current_market_condition == 'BULLISH':
+                atr_multiplier = 2.0  # Wide stops in bullish trend
+            elif self.current_market_condition == 'EXTREME_BEARISH':
+                atr_multiplier = 1.3  # Tighter stops in extreme bearish trend
+            elif self.current_market_condition == 'BEARISH':
+                atr_multiplier = 1.5  # Medium stops in bearish trend
+            elif self.current_market_condition == 'SQUEEZE':
+                atr_multiplier = 1.2  # Be ready for breakout with moderately tight stops
+            else:  # SIDEWAYS
+                atr_multiplier = 1.0  # Tighter stops in sideways market
+            
+            # Apply RAYSOL-specific adjustments
+            if is_raysol:
+                original_multiplier = atr_multiplier
+                atr_multiplier = atr_multiplier * 1.35  # Reduced from 1.5 to 1.35 for better win rate
+                logger.info(f"RAYSOL token detected: Increasing ATR multiplier from {original_multiplier} to {atr_multiplier}")
+            
+            # Calculate stop loss price - use support/resistance levels if available
+            if side == "BUY":  # Long
+                # Base stop on ATR initially
+                atr_stop_distance = atr * atr_multiplier
+                atr_stop_price = entry_price - atr_stop_distance
                 
-                # Base multiplier on market condition
-                if self.current_market_condition == 'BULLISH':
-                    atr_multiplier = 2.0  # Wider stops in bullish trend
-                elif self.current_market_condition == 'BEARISH':
-                    atr_multiplier = 1.5  # Medium stops in bearish trend
-                else:  # SIDEWAYS
-                    atr_multiplier = 1.0  # Tighter stops in sideways market
-                
-                # Apply RAYSOL-specific adjustments - increase multiplier by 50%
-                if is_raysol:
-                    original_multiplier = atr_multiplier
-                    atr_multiplier = atr_multiplier * 1.5
-                    logger.info(f"RAYSOL token detected: Increasing ATR multiplier from {original_multiplier} to {atr_multiplier}")
-                
-                # Calculate stop loss price - use ATR * multiplier but cap it
-                if side == "BUY":  # Long
-                    # Cap maximum stop distance to standard percentage stop loss
-                    max_stop_distance = entry_price * STOP_LOSS_PCT
-                    # For RAYSOL, increase the maximum stop distance by 50%
-                    if is_raysol:
-                        max_stop_distance = max_stop_distance * 1.5
-                    atr_stop_distance = min(atr * atr_multiplier, max_stop_distance)
-                    stop_price = entry_price - atr_stop_distance
-                else:  # Short
-                    max_stop_distance = entry_price * STOP_LOSS_PCT
-                    # For RAYSOL, increase the maximum stop distance by 50%
-                    if is_raysol:
-                        max_stop_distance = max_stop_distance * 1.5
-                    atr_stop_distance = min(atr * atr_multiplier, max_stop_distance)
-                    stop_price = entry_price + atr_stop_distance
-                
-                # Apply price precision
-                symbol_info = self.binance_client.get_symbol_info(symbol)
-                if symbol_info:
-                    price_precision = symbol_info['price_precision']
-                    stop_price = round(stop_price, price_precision)
-                    
-                # Add RAYSOL-specific buffer information to log
-                if is_raysol:
-                    logger.info(f"Calculated RAYSOL-specific ATR-based stop loss at {stop_price} "
-                              f"(ATR: {atr:.6f}, {atr_pct*100:.2f}% of price, "
-                              f"Multiplier: {atr_multiplier}, Enhanced buffer active)")
+                # For long positions, consider nearest support level
+                if nearest_support:
+                    support_distance = entry_price - nearest_support
+                    # Only use support level if it's not too far (max 1.5x ATR distance)
+                    if support_distance <= atr_stop_distance * 1.5:
+                        # Place stop slightly below support (5% of ATR)
+                        support_stop_price = nearest_support - (atr * 0.05)
+                        # Use the better (higher) of the two stop prices
+                        stop_price = max(atr_stop_price, support_stop_price)
+                        logger.info(f"Using support-based stop loss: {stop_price} (support level: {nearest_support})")
+                    else:
+                        stop_price = atr_stop_price
                 else:
-                    logger.info(f"Calculated ATR-based stop loss at {stop_price} "
-                              f"(ATR: {atr:.6f}, {atr_pct*100:.2f}% of price, "
-                              f"Multiplier: {atr_multiplier})")
-                return stop_price
+                    stop_price = atr_stop_price
+                    
+                # Cap maximum stop distance to standard percentage stop loss * multiplier
+                max_stop_pct = STOP_LOSS_PCT
+                if self.current_market_condition == 'EXTREME_BEARISH':
+                    max_stop_pct = STOP_LOSS_PCT * 0.8  # Tighter in extreme bear markets
+                elif self.current_market_condition == 'BEARISH':
+                    max_stop_pct = STOP_LOSS_PCT * 0.9  # Slightly tighter in bear markets
+                
+                # For RAYSOL, adapt the maximum stop distance
+                if is_raysol:
+                    max_stop_pct = max_stop_pct * 1.25  # Reduced from 1.5 to 1.25 for better win rate
+                    
+                max_stop_distance = entry_price * max_stop_pct
+                min_stop_price = entry_price - max_stop_distance
+                
+                # Ensure stop price doesn't exceed max distance
+                stop_price = max(stop_price, min_stop_price)
+                
+            else:  # Short
+                # Base stop on ATR initially
+                atr_stop_distance = atr * atr_multiplier
+                atr_stop_price = entry_price + atr_stop_distance
+                
+                # For short positions, consider nearest resistance level
+                if nearest_resistance:
+                    resistance_distance = nearest_resistance - entry_price
+                    # Only use resistance level if it's not too far (max 1.5x ATR distance)
+                    if resistance_distance <= atr_stop_distance * 1.5:
+                        # Place stop slightly above resistance (5% of ATR)
+                        resistance_stop_price = nearest_resistance + (atr * 0.05)
+                        # Use the better (lower) of the two stop prices
+                        stop_price = min(atr_stop_price, resistance_stop_price)
+                        logger.info(f"Using resistance-based stop loss: {stop_price} (resistance level: {nearest_resistance})")
+                    else:
+                        stop_price = atr_stop_price
+                else:
+                    stop_price = atr_stop_price
+                
+                # Cap maximum stop distance to standard percentage stop loss * multiplier
+                max_stop_pct = STOP_LOSS_PCT
+                if self.current_market_condition == 'EXTREME_BULLISH':
+                    max_stop_pct = STOP_LOSS_PCT * 0.8  # Tighter in extreme bull markets
+                elif self.current_market_condition == 'BULLISH':
+                    max_stop_pct = STOP_LOSS_PCT * 0.9  # Slightly tighter in bull markets
+                
+                # For RAYSOL, adapt the maximum stop distance
+                if is_raysol:
+                    max_stop_pct = max_stop_pct * 1.25  # Reduced from 1.5 to 1.25 for better win rate
+                    
+                max_stop_distance = entry_price * max_stop_pct
+                max_stop_price = entry_price + max_stop_distance
+                
+                # Ensure stop price doesn't exceed max distance
+                stop_price = min(stop_price, max_stop_price)
+            
+            # Apply price precision
+            symbol_info = self.binance_client.get_symbol_info(symbol)
+            if symbol_info:
+                price_precision = symbol_info['price_precision']
+                stop_price = round(stop_price, price_precision)
+                
+            # Add detailed log information for better understanding
+            if is_raysol:
+                logger.info(f"Calculated optimized RAYSOL-specific stop loss at {stop_price} "
+                          f"(ATR: {atr:.6f}, {atr_pct*100:.2f}% of price, "
+                          f"Multiplier: {atr_multiplier}, Market condition: {self.current_market_condition})")
+            else:
+                logger.info(f"Calculated optimized ATR-based stop loss at {stop_price} "
+                          f"(ATR: {atr:.6f}, {atr_pct*100:.2f}% of price, "
+                          f"Multiplier: {atr_multiplier}, Market condition: {self.current_market_condition})")
+            return stop_price
                 
         except Exception as e:
             logger.error(f"Error calculating volatility-based stop loss: {e}")

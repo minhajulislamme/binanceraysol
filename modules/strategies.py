@@ -513,9 +513,12 @@ class RaysolDynamicGridStrategy(TradingStrategy):
     
     def classify_market_condition(self, df):
         """
-        Improved market condition classification with better sideways detection
+        Enhanced market condition classification with better state transitions and stability
         """
         conditions = []
+        lookback_period = 10  # Use more historical data for smoother transitions
+        current_condition = None
+        condition_streak = 0  # Track how long we've been in a condition
         
         for i in range(len(df)):
             if i < self.adx_period:
@@ -531,55 +534,125 @@ class RaysolDynamicGridStrategy(TradingStrategy):
             supertrend_dir = df['supertrend_direction'].iloc[i] if i >= self.supertrend_period else 0
             macd_crossover = df['macd_crossover'].iloc[i] if 'macd_crossover' in df else 0
             
+            # Get average ADX for more stability
+            lookback = min(lookback_period, i)
+            avg_adx = df['adx'].iloc[i-lookback:i+1].mean() if i >= lookback else adx
+            
             # Check for squeeze condition (low volatility, potential breakout)
             is_squeeze = bb_width < self.squeeze_threshold
             
-            # Enhanced condition classification with multi-indicator confirmation
-            # Strong bullish trend confirmation
-            if (adx > self.adx_threshold and 
-                di_plus > di_minus and 
-                supertrend_dir > 0 and
-                (rsi > 50 or macd_crossover > 0)):
-                conditions.append('BULLISH')
-                
-            # Strong bearish trend confirmation
-            elif (adx > self.adx_threshold and 
-                  di_minus > di_plus and 
-                  supertrend_dir < 0 and
-                  (rsi < 50 or macd_crossover < 0)):
-                conditions.append('BEARISH')
-                
-            # Extreme bullish trend
-            elif (adx > self.adx_threshold * 1.5 and 
-                  di_plus > di_minus * 1.5 and 
-                  supertrend_dir > 0):
-                conditions.append('EXTREME_BULLISH')
-                
-            # Extreme bearish trend
-            elif (adx > self.adx_threshold * 1.5 and 
-                  di_minus > di_plus * 1.5 and 
-                  supertrend_dir < 0):
-                conditions.append('EXTREME_BEARISH')
-                
-            # Squeeze condition (potential breakout)
-            elif is_squeeze:
-                conditions.append('SQUEEZE')
-                
-            # Weak trend or consolidation
-            elif adx < self.sideways_threshold:
-                conditions.append('SIDEWAYS')
-                
-            # Moderate bullish trend
-            elif di_plus > di_minus and supertrend_dir > 0:
-                conditions.append('BULLISH')
-                
-            # Moderate bearish trend
-            elif di_minus > di_plus and supertrend_dir < 0:
-                conditions.append('BEARISH')
-                
-            # Default to sideways if no clear condition
+            # Calculate the strength of each potential market condition
+            bullish_strength = 0
+            bearish_strength = 0
+            sideways_strength = 0
+            squeeze_strength = 0
+            
+            # ADX trending strength (0-100)
+            trend_strength = min(100, adx * 2)  # Normalize to 0-100 scale
+            
+            # Directional bias (-100 to +100, negative = bearish, positive = bullish)
+            if di_plus + di_minus > 0:  # Avoid division by zero
+                directional_bias = 100 * (di_plus - di_minus) / (di_plus + di_minus)
             else:
-                conditions.append('SIDEWAYS')
+                directional_bias = 0
+                
+            # Supertrend confirmation
+            supertrend_bias = 100 if supertrend_dir > 0 else -100 if supertrend_dir < 0 else 0
+            
+            # RSI bias (normalized to -100 to +100)
+            rsi_bias = (rsi - 50) * 2  # 0 = neutral, +100 = extremely bullish, -100 = extremely bearish
+            
+            # Combine for final bias score
+            bias_score = (directional_bias + supertrend_bias + rsi_bias) / 3
+            
+            # Calculate condition strengths
+            if bias_score > 30 and trend_strength > 50:  # Strong bullish
+                bullish_strength = trend_strength
+                
+                # Determine if extreme bullish
+                if bias_score > 60 and trend_strength > 70 and adx > self.adx_threshold * 1.5:
+                    bullish_strength += 30  # Extra boost for extreme bullish
+            
+            if bias_score < -30 and trend_strength > 50:  # Strong bearish
+                bearish_strength = trend_strength
+                
+                # Determine if extreme bearish
+                if bias_score < -60 and trend_strength > 70 and adx > self.adx_threshold * 1.5:
+                    bearish_strength += 30  # Extra boost for extreme bearish
+            
+            if trend_strength < 40:  # Low trend strength = sideways
+                sideways_strength = 100 - trend_strength
+                
+            if is_squeeze:
+                squeeze_strength = 100 if bb_width < self.squeeze_threshold * 0.7 else 70
+            
+            # Prevent rapid condition changes by requiring larger threshold to change states
+            new_condition = None
+            
+            # Determine the new condition based on highest strength
+            if max(bullish_strength, bearish_strength, sideways_strength, squeeze_strength) == bullish_strength:
+                if bullish_strength > 80:
+                    new_condition = 'EXTREME_BULLISH'
+                else:
+                    new_condition = 'BULLISH'
+            elif max(bullish_strength, bearish_strength, sideways_strength, squeeze_strength) == bearish_strength:
+                if bearish_strength > 80:
+                    new_condition = 'EXTREME_BEARISH'
+                else:
+                    new_condition = 'BEARISH'
+            elif max(bullish_strength, bearish_strength, sideways_strength, squeeze_strength) == squeeze_strength:
+                new_condition = 'SQUEEZE'
+            else:
+                new_condition = 'SIDEWAYS'
+            
+            # Apply hysteresis to avoid rapid condition changes
+            # Only change condition if new one is persistent or very strong
+            if i > 0 and current_condition:
+                previous_condition = conditions[i-1]
+                
+                # Keep current condition unless we have a strong signal to change
+                # This prevents whipsaws between market states
+                if previous_condition != new_condition:
+                    # For a change to occur, the new condition needs to be significantly stronger
+                    change_threshold = 20 if condition_streak < 3 else 10
+                    
+                    max_current_strength = 0
+                    if previous_condition == 'BULLISH' or previous_condition == 'EXTREME_BULLISH':
+                        max_current_strength = bullish_strength
+                    elif previous_condition == 'BEARISH' or previous_condition == 'EXTREME_BEARISH':
+                        max_current_strength = bearish_strength
+                    elif previous_condition == 'SQUEEZE':
+                        max_current_strength = squeeze_strength
+                    else:  # SIDEWAYS
+                        max_current_strength = sideways_strength
+                    
+                    max_new_strength = 0
+                    if new_condition == 'BULLISH' or new_condition == 'EXTREME_BULLISH':
+                        max_new_strength = bullish_strength
+                    elif new_condition == 'BEARISH' or new_condition == 'EXTREME_BEARISH':
+                        max_new_strength = bearish_strength
+                    elif new_condition == 'SQUEEZE':
+                        max_new_strength = squeeze_strength
+                    else:  # SIDEWAYS
+                        max_new_strength = sideways_strength
+                    
+                    # Only change if the new condition is significantly stronger
+                    if max_new_strength > max_current_strength + change_threshold:
+                        conditions.append(new_condition)
+                        current_condition = new_condition
+                        condition_streak = 1
+                    else:
+                        conditions.append(previous_condition)
+                        current_condition = previous_condition
+                        condition_streak += 1
+                else:
+                    conditions.append(previous_condition)
+                    current_condition = previous_condition
+                    condition_streak += 1
+            else:
+                conditions.append(new_condition)
+                current_condition = new_condition
+                condition_streak = 1
         
         return pd.Series(conditions, index=df.index)
     
@@ -920,30 +993,49 @@ class RaysolDynamicGridStrategy(TradingStrategy):
     def get_multi_indicator_signal(self, df):
         """
         Get signals based on multi-indicator confirmation with stronger consolidated validation
+        and enhanced filtering to reduce false positives
         """
-        if len(df) < 5:
+        if len(df) < 10:  # Increased minimum data requirement for better context
             return None
             
         latest = df.iloc[-1]
         prev = df.iloc[-2]
+        prev3 = df.iloc[-3] if len(df) > 3 else None
+        prev5 = df.iloc[-5] if len(df) > 5 else None
         
         # Count bullish and bearish signals with weighting for stronger indicators
         bullish_signals = 0
         bearish_signals = 0
         
+        # Check for trend consistency over multiple candles (reduces false signals)
+        is_consistent_trend = False
+        if len(df) >= 5:
+            # Check if the last 5 candles show consistent trend direction
+            last_5_supertrend = [df.iloc[-i]['supertrend_direction'] for i in range(1, 6)]
+            if all(direction == 1 for direction in last_5_supertrend):
+                is_consistent_trend = True
+                bullish_signals += 1  # Bonus for trend consistency
+            elif all(direction == -1 for direction in last_5_supertrend):
+                is_consistent_trend = True
+                bearish_signals += 1  # Bonus for trend consistency
+        
         # === PRIMARY INDICATORS (Higher weight) ===
         
-        # Supertrend (stronger weight x2)
+        # Supertrend (stronger weight x2.5 for consistent trends)
         if latest['supertrend_direction'] == 1:
-            bullish_signals += 2
+            bullish_signals += 2.5 if is_consistent_trend else 2.0
         else:
-            bearish_signals += 2
+            bearish_signals += 2.5 if is_consistent_trend else 2.0
             
-        # Price action relative to key levels
-        if latest['close'] > latest['ema_slow'] and latest['close'] > latest['vwap']:
-            bullish_signals += 1.5  # Strong bullish price action
-        elif latest['close'] < latest['ema_slow'] and latest['close'] < latest['vwap']:
-            bearish_signals += 1.5  # Strong bearish price action
+        # Price action relative to key levels with stronger confirmation
+        if (latest['close'] > latest['ema_slow'] and 
+            latest['close'] > latest['vwap'] and
+            latest['close'] > latest['ema_fast']):  # Added requirement for all EMAs
+            bullish_signals += 2.0  # Increased weight for stronger price action
+        elif (latest['close'] < latest['ema_slow'] and 
+              latest['close'] < latest['vwap'] and
+              latest['close'] < latest['ema_fast']):  # Added requirement for all EMAs
+            bearish_signals += 2.0  # Increased weight for stronger price action
         
         # Trend direction change (stronger weight)
         if prev['supertrend_direction'] == -1 and latest['supertrend_direction'] == 1:
@@ -1024,36 +1116,68 @@ class RaysolDynamicGridStrategy(TradingStrategy):
             
         # === MARKET CONDITION ADJUSTMENT ===
         
-        # Adjust signal thresholds based on market condition
+        # Adjust signal thresholds based on market condition - higher thresholds to reduce false signals
         market_condition = latest['market_condition']
-        bull_threshold = 5.0  # Base threshold
-        bear_threshold = 5.0  # Base threshold
+        bull_threshold = 7.0  # Increased base threshold for stronger confirmation
+        bear_threshold = 7.0  # Increased base threshold for stronger confirmation
+        
+        # Volume requirement - ensure we have enough volume to validate signals
+        min_volume_ratio = 1.2  # Minimum volume needed relative to average
+        has_sufficient_volume = latest['volume_ratio'] >= min_volume_ratio
+        
+        # Add requirement for sufficient volume in trending markets
+        if not has_sufficient_volume:
+            bull_threshold += 1.0  # Make it harder to trigger without enough volume
+            bear_threshold += 1.0  # Make it harder to trigger without enough volume
         
         if market_condition in ['BULLISH', 'EXTREME_BULLISH']:
-            bull_threshold -= 0.5  # Easier to trigger buy in bullish market
-            bear_threshold += 1.0  # Harder to trigger sell in bullish market
+            bull_threshold -= 1.0  # Easier to trigger buy in bullish market, but still higher than before
+            bear_threshold += 1.5  # Much harder to trigger sell in bullish market
         elif market_condition in ['BEARISH', 'EXTREME_BEARISH']:
-            bull_threshold += 1.0  # Harder to trigger buy in bearish market
-            bear_threshold -= 0.5  # Easier to trigger sell in bearish market
+            bull_threshold += 1.5  # Much harder to trigger buy in bearish market
+            bear_threshold -= 1.0  # Easier to trigger sell in bearish market, but still higher than before
         elif market_condition == 'SQUEEZE':
-            # In squeeze, wait for stronger confirmation
-            bull_threshold += 0.5
-            bear_threshold += 0.5
+            # In squeeze, wait for much stronger confirmation
+            bull_threshold += 1.5
+            bear_threshold += 1.5
             
         # === FINAL SIGNAL DETERMINATION ===
         
         # Calculate signal strength as a percentage of max possible
-        bull_strength = bullish_signals / 15 * 100  # 15 is approximate max possible score
-        bear_strength = bearish_signals / 15 * 100
+        max_possible_score = 20  # Increased from 15 to account for new signal weights
+        bull_strength = bullish_signals / max_possible_score * 100
+        bear_strength = bearish_signals / max_possible_score * 100
+        
+        # Check for trend continuation or reversal - add strength for continuation
+        has_momentum = False
+        if len(df) >= 3:
+            # Check previous signal direction to add momentum confirmation
+            # This helps filter out minor counter-trend moves
+            prev_candle_momentum = prev['close'] - prev['open']
+            current_candle_momentum = latest['close'] - latest['open']
+            
+            # If momentum is in the same direction for 2+ candles, it's stronger
+            if (prev_candle_momentum > 0 and current_candle_momentum > 0 and bullish_signals > bearish_signals):
+                bullish_signals += 1.0  # Bonus for momentum continuation
+                has_momentum = True
+            elif (prev_candle_momentum < 0 and current_candle_momentum < 0 and bearish_signals > bullish_signals):
+                bearish_signals += 1.0  # Bonus for momentum continuation
+                has_momentum = True
         
         logger.debug(f"Multi-indicator signals - Bullish: {bullish_signals:.1f} ({bull_strength:.1f}%), " +
                     f"Bearish: {bearish_signals:.1f} ({bear_strength:.1f}%)")
         
-        # Return signal based on strong confirmation from multiple indicators
-        if bullish_signals >= bull_threshold and bullish_signals > bearish_signals * 1.5:
+        # Return signal based on very strong confirmation from multiple indicators
+        # Added more stringent requirements with 2x difference instead of 1.5x
+        if (bullish_signals >= bull_threshold and 
+            bullish_signals > bearish_signals * 2.0 and  # Stronger dominance required
+            (has_momentum or bull_strength > 60)):  # Either has momentum or strong overall score
             logger.info(f"Strong bullish confirmation: {bullish_signals:.1f} signals ({bull_strength:.1f}%)")
             return 'BUY'
-        if bearish_signals >= bear_threshold and bearish_signals > bullish_signals * 1.5:
+            
+        if (bearish_signals >= bear_threshold and 
+            bearish_signals > bullish_signals * 2.0 and  # Stronger dominance required
+            (has_momentum or bear_strength > 60)):  # Either has momentum or strong overall score
             logger.info(f"Strong bearish confirmation: {bearish_signals:.1f} signals ({bear_strength:.1f}%)")
             return 'SELL'
             
