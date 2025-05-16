@@ -144,6 +144,7 @@ class RaysolDynamicGridStrategy(TradingStrategy):
     - Fibonacci level integration for support/resistance
     - Enhanced momentum filtering and multi-indicator confirmation
     - Sophisticated reversal detection
+    - Signal persistence to prevent rapid switching
     """
     def __init__(self, 
                  grid_levels=5, 
@@ -159,17 +160,21 @@ class RaysolDynamicGridStrategy(TradingStrategy):
                  adx_threshold=25,
                  sideways_threshold=15,
                  # RAYSOL-specific parameters
-                 volatility_multiplier=1.1,
-                 trend_condition_multiplier=1.3,
-                 min_grid_spacing=0.6,
-                 max_grid_spacing=3.5,
+                 volatility_multiplier=1.2,
+                 trend_condition_multiplier=1.4,
+                 min_grid_spacing=0.5,
+                 max_grid_spacing=3.0,
                  # New parameters for enhanced features
                  supertrend_period=10,
                  supertrend_multiplier=3.0,
                  fibonacci_levels=[0.236, 0.382, 0.5, 0.618, 0.786],
                  squeeze_threshold=0.5,
                  cooloff_period=3,
-                 max_consecutive_losses=2):
+                 max_consecutive_losses=2,
+                 # Signal stability parameters
+                 min_candles_between_signals=2,
+                 signal_persistence_threshold=2,
+                 same_direction_candles_required=2):
         
         super().__init__('RaysolDynamicGridStrategy')
         # Base parameters
@@ -200,6 +205,11 @@ class RaysolDynamicGridStrategy(TradingStrategy):
         self.cooloff_period = cooloff_period
         self.max_consecutive_losses = max_consecutive_losses
         
+        # Signal stability parameters
+        self.min_candles_between_signals = min_candles_between_signals  # Minimum candles between opposite signals
+        self.signal_persistence_threshold = signal_persistence_threshold  # Required confirmations before signal change
+        self.same_direction_candles_required = same_direction_candles_required  # Candles needed in same direction
+        
         # State variables
         self.grids = None
         self.current_trend = None
@@ -210,6 +220,15 @@ class RaysolDynamicGridStrategy(TradingStrategy):
         self.fib_support_levels = []
         self.fib_resistance_levels = []
         self.position_size_pct = 1.0  # Default position size percentage
+        
+        # Signal stability state variables
+        self.last_signal = None
+        self.last_signal_time = None
+        self.last_signal_price = None
+        self.current_signal_counter = 0
+        self.pending_signal = None
+        self.pending_signal_counter = 0
+        self.candles_since_last_signal = 0
         
         # Cached indicators to avoid recalculation
         self._last_kline_time = None
@@ -1126,8 +1145,8 @@ class RaysolDynamicGridStrategy(TradingStrategy):
         
         # Adjust signal thresholds based on market condition - higher thresholds to reduce false signals
         market_condition = latest['market_condition']
-        bull_threshold = 7.0  # Increased base threshold for stronger confirmation
-        bear_threshold = 7.0  # Increased base threshold for stronger confirmation
+        bull_threshold = 7.0  # Increased from 15 to account for new signal weights
+        bear_threshold = 7.0  # Increased from 15 to account for new signal weights
         
         # Volume requirement - ensure we have enough volume to validate signals
         min_volume_ratio = 1.2  # Minimum volume needed relative to average
@@ -1437,6 +1456,7 @@ class RaysolDynamicGridStrategy(TradingStrategy):
         latest = df.iloc[-1]
         market_condition = latest['market_condition']
         current_time = latest['open_time']
+        current_price = latest['close']
         
         # Update risk manager with current market condition
         if self.risk_manager:
@@ -1447,67 +1467,133 @@ class RaysolDynamicGridStrategy(TradingStrategy):
             logger.info(f"In cool-off period after {self.consecutive_losses} consecutive losses. No trading signals.")
             return None
         
+        # Increment the counter for candles since last signal
+        if self.last_signal is not None:
+            self.candles_since_last_signal += 1
+        
+        # Detect the raw signal from various signal sources
+        raw_signal = None
+        signal_source = None
+        
         # 1. Check for V-shaped reversals in extreme market conditions
         reversal_signal = self.get_v_reversal_signal(df)
         if reversal_signal:
-            logger.info(f"V-reversal detected in {market_condition} market. Signal: {reversal_signal}")
-            # REVERSED: Return the opposite signal
-            return "SELL" if reversal_signal == "BUY" else "BUY"
+            signal_source = "V-reversal"
+            # REVERSED: Get the opposite signal
+            raw_signal = "SELL" if reversal_signal == "BUY" else "BUY"
         
         # 2. Check for breakouts from squeeze conditions
-        squeeze_signal = self.get_squeeze_breakout_signal(df)
-        if squeeze_signal:
-            logger.info(f"Squeeze breakout detected. Signal: {squeeze_signal}")
-            # REVERSED: Return the opposite signal
-            return "SELL" if squeeze_signal == "BUY" else "BUY"
+        if raw_signal is None:
+            squeeze_signal = self.get_squeeze_breakout_signal(df)
+            if squeeze_signal:
+                signal_source = "Squeeze breakout"
+                # REVERSED: Get the opposite signal
+                raw_signal = "SELL" if squeeze_signal == "BUY" else "BUY"
         
         # 3. Check for multi-indicator confirmation signals
-        multi_signal = self.get_multi_indicator_signal(df)
-        if multi_signal:
-            logger.info(f"Multi-indicator confirmation. Signal: {multi_signal}")
-            # REVERSED: Return the opposite signal
-            return "SELL" if multi_signal == "BUY" else "BUY"
+        if raw_signal is None:
+            multi_signal = self.get_multi_indicator_signal(df)
+            if multi_signal:
+                signal_source = "Multi-indicator"
+                # REVERSED: Get the opposite signal
+                raw_signal = "SELL" if multi_signal == "BUY" else "BUY"
         
         # 4. Get grid signal (works in all market conditions)
-        grid_signal = self.get_grid_signal(df)
-        # REVERSED: If we have a grid signal, reverse it
-        grid_signal = "SELL" if grid_signal == "BUY" else ("BUY" if grid_signal == "SELL" else None)
+        if raw_signal is None:
+            grid_signal = self.get_grid_signal(df)
+            # REVERSED: If we have a grid signal, reverse it
+            if grid_signal:
+                signal_source = "Grid"
+                raw_signal = "SELL" if grid_signal == "BUY" else "BUY"
         
         # 5. Get specific signals based on market condition
-        if market_condition in ['EXTREME_BULLISH', 'EXTREME_BEARISH']:
-            condition_signal = self.get_extreme_market_signal(df)
-            logger.debug(f"EXTREME market detected. Grid signal: {grid_signal}, Extreme signal: {condition_signal}")
+        if raw_signal is None:
+            if market_condition in ['EXTREME_BULLISH', 'EXTREME_BEARISH']:
+                condition_signal = self.get_extreme_market_signal(df)
+                if condition_signal:
+                    signal_source = f"Extreme {market_condition}"
+                    # REVERSED: Get the opposite signal
+                    raw_signal = "SELL" if condition_signal == "BUY" else "BUY"
+                    
+            elif market_condition in ['BULLISH', 'BEARISH']:
+                if market_condition == 'BULLISH':
+                    condition_signal = self.get_bullish_signal(df)
+                else:
+                    condition_signal = self.get_bearish_signal(df)
+                    
+                if condition_signal:
+                    signal_source = f"{market_condition} trend"
+                    # REVERSED: Get the opposite signal
+                    raw_signal = "SELL" if condition_signal == "BUY" else "BUY"
+                    
+            elif market_condition == 'SIDEWAYS':
+                condition_signal = self.get_sideways_signal(df)
+                if condition_signal:
+                    signal_source = "Sideways"
+                    # REVERSED: Get the opposite signal
+                    raw_signal = "SELL" if condition_signal == "BUY" else "BUY"
+        
+        # Now apply signal persistence logic
+        final_signal = None
+        
+        # If no signal detected, return None
+        if raw_signal is None:
+            return None
             
-            # In extreme market conditions, prefer the condition-specific signal
-            if condition_signal:
-                # REVERSED: Return the opposite signal
-                return "SELL" if condition_signal == "BUY" else "BUY"
+        # If this is the first signal ever, set it as the current signal
+        if self.last_signal is None:
+            logger.info(f"Initial {raw_signal} signal from {signal_source}")
+            self.last_signal = raw_signal
+            self.last_signal_time = current_time
+            self.last_signal_price = current_price
+            self.current_signal_counter = 1
+            self.pending_signal = None
+            self.pending_signal_counter = 0
+            self.candles_since_last_signal = 0
+            return raw_signal
+            
+        # If the new signal is the same as our last signal, increment the counter
+        if raw_signal == self.last_signal:
+            self.current_signal_counter += 1
+            self.pending_signal = None
+            self.pending_signal_counter = 0
+            return self.last_signal
+            
+        # If the new signal is different from our last signal
+        else:
+            # If we haven't waited enough candles, ignore the signal
+            if self.candles_since_last_signal < self.min_candles_between_signals:
+                logger.info(f"Ignored {raw_signal} signal from {signal_source}: Only {self.candles_since_last_signal} candles since last {self.last_signal} signal (need {self.min_candles_between_signals})")
+                return None
                 
-        elif market_condition in ['BULLISH', 'BEARISH']:
-            if market_condition == 'BULLISH':
-                condition_signal = self.get_bullish_signal(df)
+            # If this is a new pending signal, initialize it
+            if self.pending_signal is None or self.pending_signal != raw_signal:
+                self.pending_signal = raw_signal
+                self.pending_signal_counter = 1
+                logger.info(f"New pending {raw_signal} signal from {signal_source} (counter: 1/{self.signal_persistence_threshold})")
+                return None
+                
+            # If this is the same pending signal, increment the counter
             else:
-                condition_signal = self.get_bearish_signal(df)
+                self.pending_signal_counter += 1
+                logger.info(f"Pending {raw_signal} signal counter: {self.pending_signal_counter}/{self.signal_persistence_threshold}")
                 
-            logger.debug(f"{market_condition} market detected. Grid signal: {grid_signal}, Condition signal: {condition_signal}")
-            
-            # In trending markets, prefer the trending signal
-            if condition_signal:
-                # REVERSED: Return the opposite signal
-                return "SELL" if condition_signal == "BUY" else "BUY"
-                
-        elif market_condition == 'SIDEWAYS':
-            condition_signal = self.get_sideways_signal(df)
-            logger.debug(f"SIDEWAYS market detected. Grid signal: {grid_signal}, Sideways signal: {condition_signal}")
-            
-            # In sideways markets, prioritize mean reversion signals
-            if condition_signal:
-                # REVERSED: Return the opposite signal
-                return "SELL" if condition_signal == "BUY" else "BUY"
-                
-        # 6. Default to grid signal if no specialized signal was returned
-        return grid_signal
-
+                # If we've reached the threshold, switch the signal
+                if self.pending_signal_counter >= self.signal_persistence_threshold:
+                    logger.info(f"Signal changed from {self.last_signal} to {raw_signal} after {self.pending_signal_counter} confirmations")
+                    self.last_signal = raw_signal
+                    self.last_signal_time = current_time
+                    self.last_signal_price = current_price
+                    self.current_signal_counter = 1
+                    self.pending_signal = None
+                    self.pending_signal_counter = 0
+                    self.candles_since_last_signal = 0
+                    return raw_signal
+                else:
+                    return None
+                    
+        # Default to no signal if we reached here somehow
+        return None
 
 # Update the factory function to include only RAYSOL strategy
 def get_strategy(strategy_name):
@@ -1535,7 +1621,6 @@ def get_strategy(strategy_name):
             adx_period=RAYSOL_ADX_PERIOD,
             adx_threshold=RAYSOL_ADX_THRESHOLD,
             sideways_threshold=RAYSOL_SIDEWAYS_THRESHOLD,
-            # Pass RAYSOL specific parameters
             volatility_multiplier=RAYSOL_VOLATILITY_MULTIPLIER,
             trend_condition_multiplier=RAYSOL_TREND_CONDITION_MULTIPLIER,
             min_grid_spacing=RAYSOL_MIN_GRID_SPACING,
@@ -1543,23 +1628,13 @@ def get_strategy(strategy_name):
         )
     }
     
-    if strategy_name in strategies:
-        return strategies[strategy_name]
-    
-    logger.warning(f"Strategy {strategy_name} not found. Defaulting to base trading strategy.")
-    return TradingStrategy(strategy_name)
-
+    return strategies.get(strategy_name)
 
 def get_strategy_for_symbol(symbol, strategy_name=None):
     """Get the appropriate strategy based on the trading symbol"""
-    # If a specific strategy is requested, use it
+    # Default to the strategy specified in the configuration or command line
     if strategy_name:
         return get_strategy(strategy_name)
-    
-    # Default to RAYSOLUSDT strategy for any symbol
-    return RaysolDynamicGridStrategy()
-    
-    # Default to base strategy if needed
-    # return TradingStrategy(symbol)
-
-# End of file
+    else:
+        # Default to RaysolDynamicGridStrategy for any symbol
+        return get_strategy('RaysolDynamicGridStrategy')
