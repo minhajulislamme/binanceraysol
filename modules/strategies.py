@@ -172,7 +172,7 @@ class RaysolDynamicGridStrategy(TradingStrategy):
                  cooloff_period=3,
                  max_consecutive_losses=2,
                  # Signal stability parameters
-                 min_candles_between_signals=2,
+                 min_candles_between_signals=3,
                  signal_persistence_threshold=2,
                  same_direction_candles_required=2):
         
