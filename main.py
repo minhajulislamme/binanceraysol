@@ -738,10 +738,11 @@ def check_for_signals(symbol=None):
             logger.error("Binance client not initialized. Cannot place trades.")
             return
             
-        if signal == "BUY":
+        # REVERSED LOGIC: Process SELL signal as BUY order and BUY signal as SELL order
+        if signal == "SELL":  # Process SELL signal as BUY order
             # Skip if already in a LONG position - don't close and reopen
             if position_amount > 0:
-                logger.info(f"Already in a LONG position ({position_amount}). Ignoring BUY signal.")
+                logger.info(f"Already in a LONG position ({position_amount}). Ignoring SELL signal (processed as BUY).")
                 return
                 
             # Handle SHORT → LONG transition
@@ -765,9 +766,9 @@ def check_for_signals(symbol=None):
                     # Check if position was actually closed (sometimes there can be a delay)
                     time.sleep(1)  # Wait a moment for the order to process
                     position = binance_client.get_position_info(symbol)
-                    if position and abs(position['position_amount']) > 0.0001:  # Using a small threshold
+                    if position and position['position_amount'] > 0.0001:  # Using a small threshold
                         logger.warning(f"⚠️ Position not fully closed. Remaining: {position['position_amount']}. Trying again...")
-                        remaining = abs(position['position_amount'])
+                        remaining = position['position_amount']
                         binance_client.place_market_order(symbol, "BUY", remaining)
                         time.sleep(1)  # Wait for the second attempt to process
                 else:
@@ -775,7 +776,7 @@ def check_for_signals(symbol=None):
                     return
             
             # Check if we should open a new position - at this point we know we don't have an existing LONG position
-            logger.info(f"Opening new LONG position based on BUY signal (current position amount: {position_amount})")
+            logger.info(f"Opening new LONG position based on SELL signal (processed as BUY) (current position amount: {position_amount})")
             if risk_manager.should_open_position(symbol):
                 stop_loss_price = risk_manager.calculate_stop_loss(symbol, "BUY", current_price)
                 
@@ -842,14 +843,14 @@ def check_for_signals(symbol=None):
                                 else:
                                     logger.error(f"❌ Failed to place take profit at {take_profit_price}")
                     else:
-                        logger.warning("⚠️ Position verification failed after BUY order. Check position manually.")
+                        logger.error(f"❌ Position verification failed! Order placed but no position found.")
                 else:
-                    logger.error("❌ Failed to place BUY order to open position")
+                    logger.error(f"❌ Failed to place BUY order!")
                     
-        elif signal == "SELL":
+        elif signal == "BUY":  # Process BUY signal as SELL order
             # Skip if already in a SHORT position - don't close and reopen
             if position_amount < 0:
-                logger.info(f"Already in a SHORT position ({position_amount}). Ignoring SELL signal.")
+                logger.info(f"Already in a SHORT position ({position_amount}). Ignoring BUY signal (processed as SELL).")
                 return
                 
             # Handle LONG → SHORT transition
@@ -862,8 +863,9 @@ def check_for_signals(symbol=None):
                 time.sleep(0.5)  # Small delay to ensure orders are cancelled
                 
                 # Close long position with market order
-                logger.info(f"Placing SELL order to close LONG position: {position_amount} {symbol}")
-                close_order = binance_client.place_market_order(symbol, "SELL", position_amount)
+                close_amount = position_amount
+                logger.info(f"Placing SELL order to close LONG position: {close_amount} {symbol}")
+                close_order = binance_client.place_market_order(symbol, "SELL", close_amount)
                 
                 if close_order:
                     order_id = close_order.get('orderId', 'unknown')
@@ -882,7 +884,7 @@ def check_for_signals(symbol=None):
                     return
                 
             # Check if we should open a new position - at this point we know we don't have an existing SHORT position
-            logger.info(f"Opening new SHORT position based on SELL signal (current position amount: {position_amount})")
+            logger.info(f"Opening new SHORT position based on BUY signal (processed as SELL) (current position amount: {position_amount})")
             if risk_manager.should_open_position(symbol):
                 stop_loss_price = risk_manager.calculate_stop_loss(symbol, "SELL", current_price)
                 
@@ -949,9 +951,9 @@ def check_for_signals(symbol=None):
                                 else:
                                     logger.error(f"❌ Failed to place take profit at {take_profit_price}")
                     else:
-                        logger.warning("⚠️ Position verification failed after SELL order. Check position manually.")
+                        logger.error(f"❌ Position verification failed! Order placed but no position found.")
                 else:
-                    logger.error("❌ Failed to place SELL order to open position")
+                    logger.error(f"❌ Failed to place SELL order!")
         
         # Handle trailing stops and take profits for existing positions - for current symbol only in multi-instance mode
         if position and abs(position['position_amount']) > 0 and position['symbol'] == symbol:
